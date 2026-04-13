@@ -309,4 +309,4 @@ boilerplate/
 
 ---
 
-*GitHub: https://github.com/\<your-username\>/OS-Jackfruit — replace with your actual fork URL.*
+*GitHub: https://github.com/bharatshandilya/OS-Jackfruit — replace with your actual fork URL.*
