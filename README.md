@@ -30,7 +30,7 @@ sudo apt install -y build-essential linux-headers-$(uname -r)
 ## 2. Build
 
 ```bash
-git clone https://github.com/<your-username>/OS-Jackfruit.git
+git clone https://github.com/bharatshandilya/OS-Jackfruit.git
 cd OS-Jackfruit/boilerplate
 
 # Full build: user-space binaries + kernel module
