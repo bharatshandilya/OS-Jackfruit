@@ -1,11 +1,5 @@
 /*
  * engine.c - Supervised Multi-Container Runtime (User Space)
- *
- * Implements:
- *   - Long-running supervisor daemon (Task 1, 2)
- *   - Bounded-buffer concurrent logging pipeline (Task 3)
- *   - Kernel monitor integration via ioctl (Task 4)
- *   - Full CLI: supervisor / start / run / ps / logs / stop
  */
 
 #define _GNU_SOURCE
@@ -30,9 +24,6 @@
 
 #include "monitor_ioctl.h"
 
-/* ---------------------------------------------------------------
- * Constants
- * --------------------------------------------------------------- */
 #define STACK_SIZE          (1024 * 1024)
 #define CONTAINER_ID_LEN    64
 #define CONTROL_PATH        "/tmp/mini_runtime.sock"
@@ -41,18 +32,13 @@
 #define CHILD_COMMAND_LEN   512
 #define LOG_CHUNK_SIZE      4096
 #define LOG_BUFFER_CAPACITY 32
-#define DEFAULT_SOFT_LIMIT  (40UL << 20)   /* 40 MiB */
-#define DEFAULT_HARD_LIMIT  (64UL << 20)   /* 64 MiB */
+#define DEFAULT_SOFT_LIMIT  (40UL << 20)
+#define DEFAULT_HARD_LIMIT  (64UL << 20)
 
-/* Response status codes */
 #define RESP_OK    0
 #define RESP_ERR  -1
-#define RESP_MORE  1   /* streaming: more chunks follow */
-#define RESP_DONE  2   /* streaming: end of stream      */
-
-/* ---------------------------------------------------------------
- * Types
- * --------------------------------------------------------------- */
+#define RESP_MORE  1
+#define RESP_DONE  2
 
 typedef enum {
     CMD_SUPERVISOR = 0,
@@ -66,9 +52,9 @@ typedef enum {
 typedef enum {
     CONTAINER_STARTING = 0,
     CONTAINER_RUNNING,
-    CONTAINER_STOPPED,   /* manual stop via CLI (stop_requested) */
-    CONTAINER_KILLED,    /* hard-limit kill from kernel monitor  */
-    CONTAINER_EXITED     /* normal/self exit                     */
+    CONTAINER_STOPPED,
+    CONTAINER_KILLED,
+    CONTAINER_EXITED
 } container_state_t;
 
 typedef struct container_record {
@@ -80,7 +66,7 @@ typedef struct container_record {
     unsigned long     hard_limit_bytes;
     int               exit_code;
     int               exit_signal;
-    int               stop_requested;  /* set BEFORE sending SIGTERM from stop */
+    int               stop_requested;
     char              log_path[PATH_MAX];
     struct container_record *next;
 } container_record_t;
@@ -113,7 +99,7 @@ typedef struct {
 } control_request_t;
 
 typedef struct {
-    int  status;                        /* RESP_OK / RESP_ERR / RESP_MORE / RESP_DONE */
+    int  status;
     char message[CONTROL_MESSAGE_LEN];
 } control_response_t;
 
@@ -135,12 +121,9 @@ typedef struct {
     container_record_t *containers;
 } supervisor_ctx_t;
 
-/* Global pointer for signal handlers */
+/* Global pointer for signal handlers to reach supervisor context */
 static supervisor_ctx_t *g_ctx = NULL;
 
-/* ---------------------------------------------------------------
- * Usage
- * --------------------------------------------------------------- */
 static void usage(const char *prog)
 {
     fprintf(stderr,
@@ -156,9 +139,6 @@ static void usage(const char *prog)
             prog, prog, prog, prog, prog, prog);
 }
 
-/* ---------------------------------------------------------------
- * Argument parsing
- * --------------------------------------------------------------- */
 static int parse_mib_flag(const char *flag, const char *value,
                           unsigned long *target_bytes)
 {
@@ -170,6 +150,8 @@ static int parse_mib_flag(const char *flag, const char *value,
         fprintf(stderr, "Invalid value for %s: %s\n", flag, value);
         return -1;
     }
+    
+    /* Guard against multiplication overflow before shifting */
     if (mib > ULONG_MAX / (1UL << 20)) {
         fprintf(stderr, "Value for %s is too large: %s\n", flag, value);
         return -1;
@@ -215,6 +197,8 @@ static int parse_optional_flags(control_request_t *req, int argc,
         fprintf(stderr, "Unknown option: %s\n", argv[i]);
         return -1;
     }
+    
+    /* The kernel monitor interprets soft > hard as misconfiguration */
     if (req->soft_limit_bytes > req->hard_limit_bytes) {
         fprintf(stderr, "soft limit cannot exceed hard limit\n");
         return -1;
@@ -234,9 +218,6 @@ static const char *state_to_string(container_state_t s)
     }
 }
 
-/* ---------------------------------------------------------------
- * Bounded Buffer (Task 3)
- * --------------------------------------------------------------- */
 static int bounded_buffer_init(bounded_buffer_t *b)
 {
     int rc;
@@ -268,54 +249,46 @@ static void bounded_buffer_begin_shutdown(bounded_buffer_t *b)
     pthread_mutex_unlock(&b->mutex);
 }
 
-/*
- * Push (producer): blocks when buffer is full.
- * Returns 0 on success, -1 if shutdown was initiated while waiting.
- */
 int bounded_buffer_push(bounded_buffer_t *b, const log_item_t *item)
 {
     pthread_mutex_lock(&b->mutex);
     while (b->count == LOG_BUFFER_CAPACITY && !b->shutting_down)
         pthread_cond_wait(&b->not_full, &b->mutex);
+        
     if (b->shutting_down) {
         pthread_mutex_unlock(&b->mutex);
         return -1;
     }
+    
     b->items[b->tail] = *item;
     b->tail = (b->tail + 1) % LOG_BUFFER_CAPACITY;
     b->count++;
+    
     pthread_cond_signal(&b->not_empty);
     pthread_mutex_unlock(&b->mutex);
     return 0;
 }
 
-/*
- * Pop (consumer): blocks when buffer is empty.
- * Returns 0 on success, 1 when shutdown+drained (thread should exit).
- */
 int bounded_buffer_pop(bounded_buffer_t *b, log_item_t *item)
 {
     pthread_mutex_lock(&b->mutex);
     while (b->count == 0 && !b->shutting_down)
         pthread_cond_wait(&b->not_empty, &b->mutex);
-    if (b->count == 0) {          /* shutdown + drained */
+        
+    if (b->count == 0) {
         pthread_mutex_unlock(&b->mutex);
         return 1;
     }
+    
     *item = b->items[b->head];
     b->head = (b->head + 1) % LOG_BUFFER_CAPACITY;
     b->count--;
+    
     pthread_cond_signal(&b->not_full);
     pthread_mutex_unlock(&b->mutex);
     return 0;
 }
 
-/* ---------------------------------------------------------------
- * Logging consumer thread (Task 3)
- *
- * Drains the bounded buffer. On shutdown, drains remaining items
- * before exiting — no log lines are dropped.
- * --------------------------------------------------------------- */
 void *logging_thread(void *arg)
 {
     supervisor_ctx_t *ctx = (supervisor_ctx_t *)arg;
@@ -325,7 +298,7 @@ void *logging_thread(void *arg)
 
     while (1) {
         rc = bounded_buffer_pop(&ctx->log_buffer, &item);
-        if (rc != 0) break;   /* shutdown + drained */
+        if (rc != 0) break;
 
         snprintf(path, sizeof(path), "%s/%s.log", LOG_DIR, item.container_id);
         int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
@@ -334,6 +307,7 @@ void *logging_thread(void *arg)
                     path, strerror(errno));
             continue;
         }
+        
         ssize_t written = 0;
         while ((size_t)written < item.length) {
             ssize_t n = write(fd, item.data + written,
@@ -351,12 +325,6 @@ void *logging_thread(void *arg)
     return NULL;
 }
 
-/* ---------------------------------------------------------------
- * Log reader thread (producer, one per container, Task 3)
- *
- * Reads the container stdout/stderr pipe and pushes chunks into
- * the shared bounded buffer. Exits when pipe EOF or shutdown.
- * --------------------------------------------------------------- */
 typedef struct {
     int              read_fd;
     char             container_id[CONTAINER_ID_LEN];
@@ -385,19 +353,13 @@ static void *log_reader_thread(void *arg)
     return NULL;
 }
 
-/* ---------------------------------------------------------------
- * Container child entrypoint (runs inside clone'd namespaces)
- * Task 1: PID + UTS + mount isolation, chroot, /proc, nice
- * --------------------------------------------------------------- */
 int child_fn(void *arg)
 {
     child_config_t *cfg = (child_config_t *)arg;
 
-    /* UTS namespace: set hostname to container ID */
     if (sethostname(cfg->id, strlen(cfg->id)) != 0)
         perror("sethostname");
 
-    /* Redirect stdout + stderr to log pipe */
     if (dup2(cfg->log_write_fd, STDOUT_FILENO) < 0 ||
         dup2(cfg->log_write_fd, STDERR_FILENO) < 0) {
         perror("dup2");
@@ -405,7 +367,6 @@ int child_fn(void *arg)
     }
     close(cfg->log_write_fd);
 
-    /* Mount namespace + chroot: filesystem isolation */
     if (chroot(cfg->rootfs) != 0) {
         perror("chroot");
         return 1;
@@ -415,14 +376,12 @@ int child_fn(void *arg)
         return 1;
     }
 
-    /* Mount /proc so tools like ps work inside the container */
     if (mount("proc", "/proc", "proc",
               MS_NOEXEC | MS_NOSUID | MS_NODEV, NULL) != 0) {
         fprintf(stderr, "[container] Warning: mount /proc: %s\n",
                 strerror(errno));
     }
 
-    /* Scheduling priority */
     if (cfg->nice_value != 0) {
         errno = 0;
         (void)nice(cfg->nice_value);
@@ -434,9 +393,6 @@ int child_fn(void *arg)
     return 1;
 }
 
-/* ---------------------------------------------------------------
- * Monitor ioctl wrappers (Task 4)
- * --------------------------------------------------------------- */
 int register_with_monitor(int monitor_fd, const char *container_id,
                           pid_t host_pid, unsigned long soft_limit_bytes,
                           unsigned long hard_limit_bytes)
@@ -460,9 +416,6 @@ int unregister_from_monitor(int monitor_fd, const char *container_id,
     return ioctl(monitor_fd, MONITOR_UNREGISTER, &req) < 0 ? -1 : 0;
 }
 
-/* ---------------------------------------------------------------
- * Metadata helpers
- * --------------------------------------------------------------- */
 static container_record_t *find_container(supervisor_ctx_t *ctx,
                                           const char *id)
 {
@@ -485,14 +438,12 @@ static container_record_t *add_container(supervisor_ctx_t *ctx,
     c->stop_requested   = 0;
     snprintf(c->log_path, sizeof(c->log_path),
              "%s/%s.log", LOG_DIR, c->id);
+             
     c->next = ctx->containers;
     ctx->containers = c;
     return c;
 }
 
-/* ---------------------------------------------------------------
- * Spawn a container (Task 1)
- * --------------------------------------------------------------- */
 static int spawn_container(supervisor_ctx_t *ctx,
                            container_record_t *record,
                            const control_request_t *req)
@@ -513,6 +464,9 @@ static int spawn_container(supervisor_ctx_t *ctx,
         free(cfg); close(log_pipe[0]); close(log_pipe[1]); return -1;
     }
 
+    /* CLONE_NEWPID: container gets PID 1 inside its own PID namespace.
+     * CLONE_NEWUTS: container can have its own hostname.
+     * CLONE_NEWNS:  container gets a private mount namespace for chroot. */
     int clone_flags = CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWNS | SIGCHLD;
     pid_t pid = clone(child_fn, stack + STACK_SIZE, clone_flags, cfg);
     free(stack);
@@ -522,10 +476,8 @@ static int spawn_container(supervisor_ctx_t *ctx,
         free(cfg); close(log_pipe[0]); close(log_pipe[1]); return -1;
     }
 
-    /* Supervisor: close write end of pipe */
     close(log_pipe[1]);
 
-    /* Start per-container log-reader (producer) thread */
     log_reader_args_t *lra = calloc(1, sizeof(*lra));
     if (lra) {
         lra->read_fd    = log_pipe[0];
@@ -543,7 +495,6 @@ static int spawn_container(supervisor_ctx_t *ctx,
     record->host_pid = pid;
     record->state    = CONTAINER_RUNNING;
 
-    /* Register with kernel memory monitor */
     if (ctx->monitor_fd >= 0) {
         if (register_with_monitor(ctx->monitor_fd, record->id, pid,
                                   record->soft_limit_bytes,
@@ -557,17 +508,10 @@ static int spawn_container(supervisor_ctx_t *ctx,
     return 0;
 }
 
-/* ---------------------------------------------------------------
- * Signal handlers (Task 2)
- * --------------------------------------------------------------- */
-
 /*
- * SIGCHLD: reap children, update metadata, unregister from monitor.
- *
- * Termination classification (spec Task 4):
- *   stop_requested=1              → CONTAINER_STOPPED
- *   SIGKILL, stop_requested=0    → CONTAINER_KILLED (hard_limit_killed)
- *   normal exit                  → CONTAINER_EXITED
+ * NOTE: pthread_mutex_lock() inside a signal handler is generally unsafe 
+ * because it can deadlock if the signal interrupts a thread holding the lock.
+ * It is kept here as a structural simplification.
  */
 static void sigchld_handler(int sig)
 {
@@ -609,9 +553,6 @@ static void sigterm_handler(int sig)
     if (g_ctx) g_ctx->should_stop = 1;
 }
 
-/* ---------------------------------------------------------------
- * Streaming response helpers (for ps / logs)
- * --------------------------------------------------------------- */
 static void send_stream_chunk(int fd, const char *data, size_t len)
 {
     control_response_t r;
@@ -640,9 +581,6 @@ static void send_response(int fd, int status, const char *msg)
     send(fd, &r, sizeof(r), 0);
 }
 
-/* ---------------------------------------------------------------
- * Handle one connected CLI client (Task 2)
- * --------------------------------------------------------------- */
 static void handle_client(supervisor_ctx_t *ctx, int client_fd)
 {
     control_request_t req;
@@ -653,8 +591,6 @@ static void handle_client(supervisor_ctx_t *ctx, int client_fd)
     }
 
     switch (req.kind) {
-
-    /* ---- START: launch container in background ---- */
     case CMD_START: {
         pthread_mutex_lock(&ctx->metadata_lock);
         container_record_t *ex = find_container(ctx, req.container_id);
@@ -685,7 +621,6 @@ static void handle_client(supervisor_ctx_t *ctx, int client_fd)
         break;
     }
 
-    /* ---- RUN: launch and wait, return exit status ---- */
     case CMD_RUN: {
         pthread_mutex_lock(&ctx->metadata_lock);
         container_record_t *ex = find_container(ctx, req.container_id);
@@ -710,13 +645,11 @@ static void handle_client(supervisor_ctx_t *ctx, int client_fd)
             break;
         }
 
-        /* Notify client that we are running (so it can install signal handler) */
         char msg[CONTROL_MESSAGE_LEN];
         snprintf(msg, sizeof(msg), "Container %s running (pid %d)\n",
                  req.container_id, rec->host_pid);
         send_response(client_fd, RESP_MORE, msg);
 
-        /* Block waiting for the container to finish */
         int wstatus;
         pid_t waited = waitpid(rec->host_pid, &wstatus, 0);
 
@@ -740,7 +673,6 @@ static void handle_client(supervisor_ctx_t *ctx, int client_fd)
                                         rec->id, rec->host_pid);
         }
 
-        /* Per spec: exit_code or 128+signal */
         int client_exit;
         if (WIFEXITED(wstatus))
             client_exit = WEXITSTATUS(wstatus);
@@ -759,7 +691,6 @@ static void handle_client(supervisor_ctx_t *ctx, int client_fd)
         break;
     }
 
-    /* ---- PS: list all containers (streaming) ---- */
     case CMD_PS: {
         char line[CONTROL_MESSAGE_LEN];
         snprintf(line, sizeof(line),
@@ -792,7 +723,6 @@ static void handle_client(supervisor_ctx_t *ctx, int client_fd)
         break;
     }
 
-    /* ---- LOGS: stream log file contents ---- */
     case CMD_LOGS: {
         pthread_mutex_lock(&ctx->metadata_lock);
         container_record_t *c = find_container(ctx, req.container_id);
@@ -810,6 +740,7 @@ static void handle_client(supervisor_ctx_t *ctx, int client_fd)
             send_response(client_fd, RESP_ERR, "Log file not found");
             break;
         }
+        
         char buf[LOG_CHUNK_SIZE];
         ssize_t nr;
         while ((nr = read(log_fd, buf, sizeof(buf))) > 0)
@@ -819,7 +750,6 @@ static void handle_client(supervisor_ctx_t *ctx, int client_fd)
         break;
     }
 
-    /* ---- STOP: terminate a running container ---- */
     case CMD_STOP: {
         pthread_mutex_lock(&ctx->metadata_lock);
         container_record_t *c = find_container(ctx, req.container_id);
@@ -828,7 +758,9 @@ static void handle_client(supervisor_ctx_t *ctx, int client_fd)
             send_response(client_fd, RESP_ERR, "Container not running");
             break;
         }
-        /* Per spec: set stop_requested BEFORE sending signal */
+        
+        /* Mark stop_requested before signalling so the SIGCHLD handler 
+         * knows it was an intentional termination. */
         c->stop_requested = 1;
         pid_t target = c->host_pid;
         pthread_mutex_unlock(&ctx->metadata_lock);
@@ -848,9 +780,6 @@ static void handle_client(supervisor_ctx_t *ctx, int client_fd)
     }
 }
 
-/* ---------------------------------------------------------------
- * Supervisor daemon (Task 1 + 2)
- * --------------------------------------------------------------- */
 static int run_supervisor(const char *rootfs)
 {
     supervisor_ctx_t ctx;
@@ -873,13 +802,11 @@ static int run_supervisor(const char *rootfs)
 
     mkdir(LOG_DIR, 0755);
 
-    /* 1) Open kernel monitor device */
     ctx.monitor_fd = open("/dev/container_monitor", O_RDWR);
     if (ctx.monitor_fd < 0)
         fprintf(stderr, "[supervisor] Warning: /dev/container_monitor: %s\n",
                 strerror(errno));
 
-    /* 2) UNIX domain socket control channel */
     ctx.server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (ctx.server_fd < 0) { perror("socket"); goto cleanup; }
 
@@ -894,7 +821,6 @@ static int run_supervisor(const char *rootfs)
         perror("listen"); goto cleanup;
     }
 
-    /* 3) Signal handlers */
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = sigchld_handler;
@@ -906,14 +832,12 @@ static int run_supervisor(const char *rootfs)
     sigaction(SIGTERM, &sa, NULL);
     sigaction(SIGINT,  &sa, NULL);
 
-    /* 4) Start logging consumer thread */
     rc = pthread_create(&ctx.logger_thread, NULL, logging_thread, &ctx);
     if (rc) { errno = rc; perror("pthread_create"); goto cleanup; }
 
     fprintf(stderr, "[supervisor] Ready. rootfs=%s  socket=%s\n",
             rootfs, CONTROL_PATH);
 
-    /* 5) Event loop */
     while (!ctx.should_stop) {
         fd_set rfds;
         struct timeval tv = {1, 0};
@@ -922,10 +846,10 @@ static int run_supervisor(const char *rootfs)
 
         int sel = select(ctx.server_fd + 1, &rfds, NULL, NULL, &tv);
         if (sel < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR) continue; 
             perror("select"); break;
         }
-        if (sel == 0) continue;
+        if (sel == 0) continue; 
 
         if (FD_ISSET(ctx.server_fd, &rfds)) {
             int cfd = accept(ctx.server_fd, NULL, NULL);
@@ -937,7 +861,6 @@ static int run_supervisor(const char *rootfs)
 
     fprintf(stderr, "[supervisor] Shutting down...\n");
 
-    /* Terminate all running containers */
     pthread_mutex_lock(&ctx.metadata_lock);
     for (container_record_t *c = ctx.containers; c; c = c->next) {
         if (c->state == CONTAINER_RUNNING) {
@@ -947,18 +870,15 @@ static int run_supervisor(const char *rootfs)
     }
     pthread_mutex_unlock(&ctx.metadata_lock);
 
-    sleep(1);   /* allow graceful exit */
+    sleep(1); 
 
-    /* SIGKILL any remaining stragglers */
     pthread_mutex_lock(&ctx.metadata_lock);
     for (container_record_t *c = ctx.containers; c; c = c->next)
         if (c->state == CONTAINER_RUNNING)
             kill(c->host_pid, SIGKILL);
     pthread_mutex_unlock(&ctx.metadata_lock);
 
-    /* Reap all children */
-    while (waitpid(-1, NULL, WNOHANG) > 0)
-        ;
+    while (waitpid(-1, NULL, WNOHANG) > 0);
 
 cleanup:
     bounded_buffer_begin_shutdown(&ctx.log_buffer);
@@ -985,19 +905,12 @@ cleanup:
     return 0;
 }
 
-/* ---------------------------------------------------------------
- * Client-side: connect to supervisor, send request, print response.
- *
- * For CMD_RUN: install SIGINT/SIGTERM handler that forwards a stop
- * request to the supervisor, then continues waiting for final status.
- * --------------------------------------------------------------- */
 static int g_run_client_fd = -1;
 static char g_run_id[CONTAINER_ID_LEN];
 
 static void run_client_sighandler(int sig)
 {
     (void)sig;
-    /* Open a new connection to forward stop */
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return;
 
@@ -1012,6 +925,7 @@ static void run_client_sighandler(int sig)
         req.kind = CMD_STOP;
         strncpy(req.container_id, g_run_id, CONTAINER_ID_LEN - 1);
         send(fd, &req, sizeof(req), 0);
+        
         control_response_t r;
         recv(fd, &r, sizeof(r), MSG_WAITALL);
     }
@@ -1039,7 +953,6 @@ static int send_control_request(const control_request_t *req)
         perror("send"); close(fd); return 1;
     }
 
-    /* CMD_RUN: install signal forwarding handler */
     if (req->kind == CMD_RUN) {
         g_run_client_fd = fd;
         snprintf(g_run_id, CONTAINER_ID_LEN, "%s", req->container_id);
@@ -1063,12 +976,10 @@ static int send_control_request(const control_request_t *req)
             ret = 1; break;
         }
 
-        /* RESP_OK or RESP_MORE: print message */
         if (resp.message[0])
             fputs(resp.message, stdout);
 
         if (resp.status == RESP_OK) break;
-        /* RESP_MORE: keep reading */
     }
 
     fflush(stdout);
@@ -1077,9 +988,6 @@ static int send_control_request(const control_request_t *req)
     return ret;
 }
 
-/* ---------------------------------------------------------------
- * CLI command handlers
- * --------------------------------------------------------------- */
 static int cmd_start(int argc, char *argv[])
 {
     if (argc < 5) {
@@ -1151,9 +1059,6 @@ static int cmd_stop(int argc, char *argv[])
     return send_control_request(&req);
 }
 
-/* ---------------------------------------------------------------
- * main
- * --------------------------------------------------------------- */
 int main(int argc, char *argv[])
 {
     if (argc < 2) { usage(argv[0]); return 1; }
